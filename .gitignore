@@ -8,6 +8,11 @@
 *.pem
 *.crt
 secrets/
+# 个人凭证文件（任何含"凭证/密码/token/credentials"的纯文本）
+*凭证*
+*credentials*
+*password*.txt
+*token*.txt
 
 # ============================================================
 # 数据库 / 用户数据
