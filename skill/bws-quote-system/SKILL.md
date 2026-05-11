@@ -450,3 +450,212 @@ viewer         → 只读 (v0.5 加分配机制)
 - 价格清洗规则 `parse_idr()` 识别 `Rp 25,000` / `500k` / `fit 550k 7间房以上：480k` / `1.220.000` 等格式
 - 跳过项:接送机车费(模型不匹配)/ 多日游产品(系统未建模)/ 导游小费规则(应做独立规则表)
 
+
+---
+
+## 十二、v0.5 → v0.8.4 速查 (2026-05-10 一天 10 个版本)
+
+### v0.5 — 报价导出三件套 + 反馈闭环
+
+**3 个新文件**:
+- `backend/app/utils/exports/__init__.py` + `context.py` + `excel_builder.py` + `pdf_builder.py` + `docx_builder.py`
+- `backend/app/templates/quote_pdf.html.j2` (WeasyPrint 模板)
+- `backend/app/routers/exports.py` — `GET /quotes/{id}/export?format=xlsx|pdf|docx`
+
+**关键避坑**:
+- weasyprint==62.3 必须锁 **pydyf==0.10.0**, pip 默认拉 0.12.x → "super has no transform" 错误
+- HTTP Content-Disposition 中文文件名:`filename="ASCII"; filename*=UTF-8''escaped` 双值
+- jinja2 模板用 `q.xxx` 但传参是 `quote=ctx['quote']` → 显式 remap
+
+**赌自费回写**: `gamble_history` 表加 4 列 (strategy_id / feedback_notes / feedback_at / feedback_by); POST `/quotes/{id}/feedback` 写入,GET `/settings/strategy-stats?days=N` 出胜率统计
+
+### v0.5.1 — 简化赌自费 UI
+
+**用户反馈**:删掉看不懂的 5 个系数(安全比/最大亏损比/首次合作/自费毛利率/MICE上限),只保留启用开关.
+**新 schema**:`GambleStrategy.extra_profit_cny` (skip 命中后反向加利润)
+**前端**:策略动作改成 ⚪🛡 不赌 / ⚪🎲 赌(让利) 二选一.skip 时显示"额外加利润 ¥/人",fixed 时显示"让利金额 ¥/人"
+
+### v0.5.2 — 赌自费业务规则升级 (5 维度)
+
+**用户原话指引**:
+> 主结构只要有自由活动不能判定不赌自费, 5 星酒店少赌, 已含水上多少赌, 全程含餐少赌, 儿童多少赌, 老年人 55+ 多少赌
+
+**新加 7 个 condition_type**: `has_any_free_activity` / `hotel_max_star_gte/lte` / `water_count_gt/gte` / `free_days_with_meals` / `child_count_gt` / `child_ratio_gt` / `senior_count_gt` / `senior_ratio_gt`
+
+**ItinerarySignals 加字段**: `hotel_max_star` (查 db 算) / `water_activity_count` / `free_days_with_meals` / `child_ratio` / `pax_senior` / `senior_ratio`
+
+**Quote 新字段**: `pax_senior` (55+ 老年人, ALTER TABLE 兼容)
+
+**12 条 seed 策略覆盖业务规则** (见 docs/今日工作记录_2026-05-10.md)
+
+**修了 UI bug**: 命中 fixed 策略时显示"系统判定:不赌自费"(自相矛盾) → 改成根据 action 显示三种状态
+- 🛡 系统判定: 不赌 (含可选"反向加利润")
+- 🎲 系统判定: 赌 · 让 ¥X/人
+- 不赌 (无策略命中)
+
+### v0.6 — AI 一键上传客户行程报价
+
+**完整新 stack**:
+- `backend/app/ai/document_parser.py:parse_itinerary_intent()` — 新 prompt (与 parse_document 抽资源不同, 这个抽 quote_draft)
+- `backend/app/utils/itinerary_matcher.py` (NEW) — fuzzy 匹配 (子串包含 + jaccard 字符重合) + detect_missing_fields
+- `backend/app/routers/ai_parser.py` 加 `/parse-itinerary` + `/quote-from-itinerary`
+- 前端 AiUploader 加 ⚡ 客户行程一键报价 卡 + 补漏 dialog
+
+**测试用例**: 巴厘岛 The Mulia (100% match) / 金巴兰沙滩 → 金巴兰海滩 (66% fuzzy)
+
+### v0.7 — 5 角色 + 23 功能 × 32 配额
+
+**新加 ops_manager 角色** (公司侧 OP, 跨 agency 帮做单, 不改设置)
+
+**新文件**: `backend/app/utils/feature_permissions.py` (集中声明)
+- `FEATURES`: 23 功能 (报价/AI/导出/反馈/管理/账号 6 类)
+- `FEATURE_REQUIREMENTS`: 角色 → 可用功能 allowlist
+- `DEFAULT_QUOTAS`: 角色 → 功能 → (period, limit) 32 项
+- `can_use_feature` / `require_feature` / `consume_quota` / `init_quotas_for_user` / `get_user_quotas`
+
+**新表**: `usage_quotas` (user_id × feature, period, limit_count, used_count, reset_at, overridden_by_admin) + `usage_logs` (审计)
+
+**关键设计**: `consume_quota` 内部立即 `db.commit()` — 即使后续业务挂掉, 配额已扣 (审计准确性硬要求)
+
+**周期重置**: 月初 1 号 00:00 UTC 自动 reset (在 `_check_and_reset` 里 lazy 检查)
+
+### v0.8 — 自助注册 + 审核 + 多步向导
+
+**User 新字段**: status 加 `pending_review` / `rejected` 取值; `application_note` / `requested_agency_name` / `review_note` / `reviewed_by_user_id` / `reviewed_at`
+
+**新端点**:
+- `GET /auth/agencies-public` (无需登录, 注册向导用)
+- `POST /auth/register-public` (无需邀请码, status='pending_review')
+- `GET /admin/pending-users`
+- `POST /admin/pending-users/{id}/review` (批准/拒绝, 自动建 agency, 自动 init_quotas)
+- `GET /admin/usage-stats?days=7` (聚合: by_feature + by_user)
+
+**login 端点状态友好提示**: pending_review/rejected/disabled 各给不同 403 message (不是统一 401)
+
+**前端**: index.html 重写注册卡为 4 状态向导
+- Step 0 选模式 (3 大入口)
+- 邀请码注册 (Step 1 校验码 → Step 2 填账号)
+- 自助申请 (Step 1 选社/角色 → Step 2 账号 → Step 3 理由)
+
+设置页"账号管理" 加 6 个子 Tab (待审核/用户/配额/邀请码/旅行社/7天统计 + super_admin 看权限矩阵)
+
+### v0.8.1 — 强制启用用户系统
+
+**问题**: 用户 .env 里 `BWS_AUTH_USERNAME` 空 → `auth_required=False` → 所有 `v-if="authRequired"` 隐藏 → 退出/我的配额/账号管理 全看不到
+
+**修法**:
+- `config.py:auth_required` 永远返回 True
+- `database.py:_ensure_bootstrap_admin()` 启动时检查, 没 super_admin 就用 .env 或默认 admin/admin123 自动建 (含配额初始化)
+- 前端去掉所有 `authRequired` 依赖, 只看 `authenticated`
+- `.env.example` 默认填 `BWS_AUTH_USERNAME=admin / BWS_AUTH_PASSWORD=admin123`
+
+### v0.8.2 — 现代 SaaS 风格登录页
+
+**用户反馈**: 老登录页太难看 (按钮挤一边, 文字溢出)
+
+**重写 CSS**: `.login-card-modern` (460px 居中卡 + 圆角 12px + 深阴影 + fadeInUp 动画)
+**全屏背景**: 深蓝渐变 `#1e2761 → #2c5282 → #3a7bd5` + 装饰圆斑
+**3 大入口按钮**: 全宽 + 图标 + 标题 + 副标题描述 + 右箭头
+**步骤进度**: el-steps 顶部
+**字段输入**: `prefix` 图标 + size="large"
+**底部跳转**: "还没有账号? 邀请码注册 / 自助申请"
+
+### v0.8.3 — 防坑功能套件
+
+**6 个关键改进**:
+
+1. `重置admin账号.bat` — 双击解锁 + 重置密码 (`docker exec ... python -c "..."`)
+2. `POST /auth/master-unlock` — 用 .env BWS_AUTH_PASSWORD 作主密钥, 解锁任意用户 + 可选重置密码 (含防爆破延迟 0.5s)
+3. 登录页"账号已锁定"下加 🔓 自助解锁 链接 → 弹 modal 输主密钥
+4. 默认密码警告 banner — 顶部橙色 sub-header (force_password_change=true 时显示)
+5. 改密 dialog (含旧密码/新密码/再次确认 三栏)
+6. 用户列表加 4 个操作: 🔓 解锁 / 🔑 改密 / 停用 / 启用
+
+**新 admin 端点**:
+- `POST /admin/users/{id}/unlock`
+- `POST /admin/users/{id}/reset-password`
+- `POST /admin/users/{id}/disable`
+- `POST /admin/users/{id}/activate`
+
+### v0.8.4 — 企业级 Header + 直接添加用户
+
+**Header 重设计**:
+- 老的橘紫渐变 → 纯深色 `#1a1f3a` (GitLab/Stripe 同款)
+- 标题不换行 (white-space: nowrap)
+- 右上角按钮收进 `el-dropdown` 用户菜单 (账号信息 / 我的配额 / 修改密码 / 退出登录)
+- 默认密码警告独立 sub-header (不挤进 header)
+- 头像用渐变蓝紫 + 用户名首字母
+
+**+ 直接添加用户**: super_admin / agency_owner 可不通过邀请码直接创建用户. POST `/users` (admin.py 已有, 加 agency_owner 边界检查 + 自动 init_quotas)
+
+### 当日累积的 7 个 .bat / .ps1 自动化脚本
+
+- `一键启动.bat` — 简化 docker compose up
+- `诊断并启动.bat` — 7 步诊断 + 自动 build + 健康检查
+- `全盘搜索并启动.bat` — 不知项目位置时找
+- `重置admin账号.bat` — 紧急重置 admin/admin123
+- `推送到github.bat / .ps1` — git init+commit+push (处理冲突)
+- `上传Release到github.bat / .ps1` — API 上传 75MB zip 到 Releases
+- `push-to-github-en.ps1` — 纯英文版 (避免编码问题)
+
+### Windows .bat / .ps1 编码踩坑(下次直接套用)
+
+**1. .bat 必须 CRLF 行结尾**
+```bash
+sed -i 's/\r$//' file.bat; sed -i 's/$/\r/' file.bat
+```
+否则 cmd 报 `'65001' 不是命令` 之类奇怪错误
+
+**2. .ps1 必须 UTF-8 with BOM**
+```bash
+printf '\xEF\xBB\xBF' > tmp; cat file.ps1 >> tmp; mv tmp file.ps1
+```
+否则 PowerShell 5 用 GBK 读 UTF-8 → 中文乱码 + 解析错误
+
+**3. cmd 中文环境 enabledelayedexpansion 不可靠**
+`!VAR!` 偶尔不展开 → URL 出现字面 `!GH_USER!` 字符串
+**解决**: 转 PowerShell `.ps1` (支持 `$var`)
+
+**4. 凡是有中文的脚本, 都另存一份纯英文版** (兜底)
+
+### 当日 8 项关键 bug 速查
+
+| Bug | 现象 | 根因 | 修复 |
+|---|---|---|---|
+| 401 切 Tab | 资源库 Tab 报"未登录" | 浏览器留旧 cookie | F12 Cookies Clear |
+| Vue insertBefore | Element Plus 内部 ref 错乱 | v-if 频繁加删 DOM | 改 v-show |
+| force_password_change UI 不消失 | 改密后 banner 还在 | 没刷新 currentUser | doChangePassword 后 await loadMe() |
+| pydyf 不兼容 weasyprint | "super has no transform" | pip 默认拉 0.12.x | 锁 pydyf==0.10.0 |
+| docker exec rm .git 失败 | "Operation not permitted" | Cowork 沙箱权限 | Windows 上 rmdir /s /q |
+| Header v-if=authRequired 全隐藏 | 退出/账号管理 都看不到 | .env BWS_AUTH_USERNAME 空 | 强制 auth_required True |
+| set /p !VAR! 不展开 | URL 出现字面 `!GH_USER!` | cmd 中文 delayedexpansion 不稳 | 转 .ps1 |
+| GitHub Permission denied (publickey) | SSH 配了仍 push 失败 | 公钥没添加到 GitHub | https://github.com/settings/ssh/new |
+
+---
+
+## 十三、新人开工 Checklist (从 v0.8.4 接手)
+
+1. **读 5 份 doc** (按顺序):
+   - `docs/今日工作记录_2026-05-10.md` (本日全流水)
+   - `docs/下次深度优化方向_2026-05-11.md` (P0/P1/P2 排好序)
+   - `docs/04_赌自费算法.md` (业务规则核心)
+   - `docs/08_账号权限系统设计.md` (5 角色 + 23 功能)
+   - `README.md` (整体架构 + 快速开始)
+
+2. **跑通本地**:
+   - `cd 预报价系统B端版本/`
+   - `cp .env.example .env` (默认 admin/admin123)
+   - `docker compose up -d --build`
+   - 浏览器开 http://localhost:8000 → admin/admin123 登录
+   - 改密码 (顶部橙色 banner 提示)
+
+3. **理解架构** (10 分钟):
+   - backend/app/ 是 FastAPI 11 个 router
+   - frontend/index.html 是单 HTML + Vue 3 (CDN, 不需要 build)
+   - Docker 镜像里包含 Cairo / Pango / Noto CJK 字体 (PDF 中文必须)
+
+4. **下一步 (按优先级)**:
+   - P0: 完成 GitHub push (用户卡在 SSH 公钥添加)
+   - P0: AI 真接 Anthropic 测一份真行程
+   - P1: 加 Alembic 替代 ALTER TABLE
+   - P1: Playwright E2E 测试
